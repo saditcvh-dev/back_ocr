@@ -1,0 +1,6 @@
+API_HOST=0.0.0.0
+API_PORT=8000
+UPLOAD_FOLDER=uploads
+EXTRACTED_FOLDER=extracted_texts
+ALLOWED_ORIGINS=http://localhost:4200,http://localhost:3000
+TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe
