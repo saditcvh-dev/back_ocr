@@ -3,16 +3,38 @@ from typing import List, Optional
 from datetime import datetime
 
 
+from pydantic import BaseModel
+from typing import List, Optional
+from datetime import datetime
+
+
 # ===============================
-# RESPUESTA AL SUBIR PDF
+# RESPUESTA AL SUBIR PDF (QUEUE)
 # ===============================
 class PDFUploadResponse(BaseModel):
     id: str
     filename: str
     size: int
-    pages: int
-    extracted_text_path: str
+    task_id: str  # ID de la tarea en Celery
+    status: str  # "pending", "processing", "completed", "failed"
     message: str
+    estimated_wait_time: Optional[float] = None  # segundos estimados
+
+
+# ===============================
+# ESTADO DEL PROCESAMIENTO
+# ===============================
+class PDFUploadStatus(BaseModel):
+    pdf_id: str
+    task_id: str
+    status: str  # "pending", "processing", "completed", "failed"
+    pages: Optional[int] = None
+    extracted_text_path: Optional[str] = None
+    used_ocr: Optional[bool] = None
+    progress: Optional[int] = None  # 0-100
+    error: Optional[str] = None
+    created_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
 
 
 # ===============================
@@ -66,3 +88,33 @@ class PDFAnalysis(BaseModel):
     pages: int
     used_ocr: bool
     extracted_text_path: Optional[str] = None
+
+
+# ===============================
+# ITEM INDIVIDUAL EN LISTA DE PDFs
+# ===============================
+class PDFListItem(BaseModel):
+    id: str
+    filename: str
+    size_bytes: int
+    size_mb: float
+    status: str  # "completed", "processing", "pending", "failed"
+    progress: int  # 0-100
+    pages: Optional[int] = None
+    task_id: str
+    upload_time: float
+    created_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    extracted_text_path: Optional[str] = None
+    used_ocr: bool
+    error: Optional[str] = None
+
+
+# ===============================
+# RESPUESTA AGRUPADA DE LISTA DE PDFs
+# ===============================
+class PDFListResponse(BaseModel):
+    total: int
+    by_status: dict  # {"completed": 5, "processing": 2, "pending": 1, "failed": 0}
+    pdfs: List[PDFListItem]
+    summary: dict  # Contiene las listas agrupadas por estado
