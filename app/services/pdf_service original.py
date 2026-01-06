@@ -24,40 +24,23 @@ class PDFService:
     def __init__(self):
         self.ocr_service = OCRService(settings.TESSERACT_CMD)
         self.max_workers = min(4, os.cpu_count() or 2)  # Ajuste seguro de hilos
-        # Añade estas configuraciones para ocrmypdf
-        self.use_ocrmypdf = getattr(settings, 'USE_OCRMYPDF', False)
-        self.ocrmypdf_language = getattr(settings, 'OCRMYPDF_LANGUAGE', 'spa')
     
-    # Agregados por: Nico
-    # Cambio: Funciones para procesamiento con OCRmyPDF
-    # Motivo: Permitir generación de PDFs searchable con OCRmyPDF además de la extracción de texto normal
-    # ==========*************** funciones OCRmyPDF ***************==========
-    
-    def extract_text_with_ocrmypdf(self, pdf_path: str, language: str = 'spa') -> Tuple[str, int, bool]:
-        """
-        Versión alternativa que usa OCRmyPDF en lugar de Tesseract
-        Solo para PDFs escaneados que necesitan OCR profesional
-        """
-        if not self._can_use_ocrmypdf():
-            logger.warning("OCRmyPDF no disponible, usando OCR normal")
-            return self.extract_text_from_pdf(pdf_path, use_ocr=True, language=language)
-        
-        logger.info(f"Procesando con OCRmyPDF: {pdf_path}")
-        
+        def _extract_with_ocrmypdf(self, pdf_path: str, language: str = 'spa') -> Tuple[str, int, bool]:
+        """Extrae texto usando ocrmypdf para OCR profesional"""
         import subprocess
         import tempfile
-        import shutil
+        from pathlib import Path
         
         temp_dir = None
         try:
-            # Crear directorio temporal
+            # Crear directorio temporal para procesamiento
             temp_dir = tempfile.mkdtemp(prefix="ocrmypdf_")
             original_path = Path(pdf_path)
             
-            # Archivo de salida
+            # Archivo de salida temporal
             ocr_output_path = Path(temp_dir) / f"{original_path.stem}_ocr.pdf"
             
-            # Comando ocrmypdf optimizado
+            # Comando ocrmypdf
             cmd = [
                 "ocrmypdf",
                 "-l", language,
@@ -71,186 +54,59 @@ class PDFService:
                 str(ocr_output_path)
             ]
             
-            logger.info(f"Ejecutando: ocrmypdf {' '.join(cmd[1:])}")
+            logger.info(f"Ejecutando ocrmypdf: {' '.join(cmd)}")
             
-            # Ejecutar
+            # Ejecutar ocrmypdf
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=300
+                timeout=300  # 5 minutos timeout
             )
             
             if result.returncode != 0:
-                logger.warning(f"OCRmyPDF falló: {result.stderr[:200]}")
-                return self.extract_text_from_pdf(pdf_path, use_ocr=True, language=language)
+                logger.warning(f"ocrmypdf falló ({result.returncode}): {result.stderr}")
+                # Fallback a OCR normal
+                return self._extract_with_fallback_ocr(pdf_path, language)
             
-            # Extraer texto del PDF con OCR
+            # Ahora extraer texto del PDF con OCR aplicado
             doc = fitz.open(str(ocr_output_path))
             total_pages = len(doc)
             
-            # Extracción rápida
+            # Extraer texto - ahora debería tener texto extraíble
             text_parts = []
             for page_num in range(total_pages):
                 page = doc.load_page(page_num)
                 page_text = page.get_text("text")
                 text_parts.append(f"\n--- Página {page_num + 1} ---\n{page_text}")
+                
+                if (page_num + 1) % 10 == 0:
+                    logger.info(f"Extrayendo texto de página {page_num + 1}/{total_pages}")
             
             doc.close()
             text = "".join(text_parts)
             
-            logger.info(f"OCRmyPDF completado: {total_pages} páginas")
+            logger.info(f"ocrmypdf completado exitosamente. Páginas: {total_pages}")
             
-            return text, total_pages, True
+            return text, total_pages, True  # used_ocr = True
             
         except subprocess.TimeoutExpired:
-            logger.error("OCRmyPDF timeout")
-            return self.extract_text_from_pdf(pdf_path, use_ocr=True, language=language)
+            logger.error("ocrmypdf timeout después de 5 minutos")
+            return self._extract_with_fallback_ocr(pdf_path, language)
             
         except Exception as e:
-            logger.error(f"Error en OCRmyPDF: {e}")
-            return self.extract_text_from_pdf(pdf_path, use_ocr=True, language=language)
+            logger.error(f"Error en ocrmypdf: {e}")
+            return self._extract_with_fallback_ocr(pdf_path, language)
             
         finally:
-            # Limpiar
+            # Limpiar directorio temporal
             if temp_dir and os.path.exists(temp_dir):
+                import shutil
                 try:
                     shutil.rmtree(temp_dir)
                 except:
                     pass
     
-    def _can_use_ocrmypdf(self) -> bool:
-        """Verifica si ocrmypdf está disponible"""
-        import subprocess
-        
-        if not self.use_ocrmypdf:
-            return False
-            
-        try:
-            # Verificar si el comando existe
-            result = subprocess.run(
-                ["ocrmypdf", "--version"],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            available = result.returncode == 0
-            if available:
-                logger.info(f"OCRmyPDF disponible: {result.stdout.strip()}")
-            return available
-        except:
-            return False
-        
-   
-
-    def process_with_searchable_pdf(self, pdf_path: str, pdf_id: str, language: str = 'spa', use_ocr: bool = True) -> Tuple[str, int, bool, Optional[str]]:
-        """
-        Procesa un PDF y genera una versión searchable con OCRmyPDF
-        Guarda el PDF searchable permanentemente para descarga
-        
-        Returns:
-            Tuple[text, pages, used_ocr, searchable_pdf_path]
-        """
-        # Modificado por: Nico
-        # Cambio: Nueva función específica para generación de PDFs searchable
-        # Motivo: Separar lógica de extracción de texto vs generación de PDFs mejorados
-        if not use_ocr:
-            # Si no se requiere OCR, extraer texto directamente
-            text, pages = self._extract_text_directly(pdf_path)
-            return text, pages, False, None
-        
-        # Verificar si OCRmyPDF está disponible
-        if not self._can_use_ocrmypdf():
-            logger.warning("OCRmyPDF no disponible, extrayendo solo texto")
-            text, pages, used_ocr = self.extract_text_from_pdf(pdf_path, use_ocr=True, language=language)
-            return text, pages, used_ocr, None
-        
-        logger.info(f"Generando PDF searchable con OCRmyPDF: {pdf_path}")
-        
-        import subprocess
-        import tempfile
-        import shutil
-        from pathlib import Path
-        
-        temp_dir = None
-        try:
-            # Crear directorio temporal para procesamiento
-            temp_dir = tempfile.mkdtemp(prefix="ocrmypdf_searchable_")
-            original_path = Path(pdf_path)
-            
-            # Archivo de salida PERMANENTE (no temporal)
-            searchable_pdf_path = Path(settings.UPLOAD_FOLDER) / f"{pdf_id}_searchable.pdf"
-            
-            # Comando ocrmypdf para generar PDF searchable
-            # NOTA: Quitamos --skip-text para que GENERE el PDF con texto
-            cmd = [
-                "ocrmypdf",
-                "-l", language,
-                "--force-ocr",
-                "--deskew",
-                "--clean",
-                "--optimize", "1",
-                "--output-type", "pdf",
-                "--quiet",
-                str(original_path),
-                str(searchable_pdf_path)
-            ]
-            
-            logger.info(f"Ejecutando OCRmyPDF para PDF searchable: {' '.join(cmd[1:])}")
-            
-            # Ejecutar OCRmyPDF
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=300
-            )
-            
-            if result.returncode != 0:
-                logger.warning(f"OCRmyPDF falló para PDF searchable: {result.stderr[:200]}")
-                # Fallback a extracción normal
-                text, pages, used_ocr = self.extract_text_from_pdf(pdf_path, use_ocr=True, language=language)
-                return text, pages, used_ocr, None
-            
-            # Extraer texto del PDF searchable generado
-            doc = fitz.open(str(searchable_pdf_path))
-            total_pages = len(doc)
-            
-            # Extraer texto
-            text_parts = []
-            for page_num in range(total_pages):
-                page = doc.load_page(page_num)
-                page_text = page.get_text("text")
-                text_parts.append(f"\n--- Página {page_num + 1} ---\n{page_text}")
-            
-            doc.close()
-            text = "".join(text_parts)
-            
-            logger.info(f"PDF searchable generado exitosamente: {searchable_pdf_path}, {total_pages} páginas")
-            
-            return text, total_pages, True, str(searchable_pdf_path)
-            
-        except subprocess.TimeoutExpired:
-            logger.error("OCRmyPDF timeout al generar PDF searchable")
-            text, pages, used_ocr = self.extract_text_from_pdf(pdf_path, use_ocr=True, language=language)
-            return text, pages, used_ocr, None
-            
-        except Exception as e:
-            logger.error(f"Error generando PDF searchable: {e}")
-            text, pages, used_ocr = self.extract_text_from_pdf(pdf_path, use_ocr=True, language=language)
-            return text, pages, used_ocr, None
-            
-        finally:
-            # Limpiar directorio temporal
-            if temp_dir and os.path.exists(temp_dir):
-                try:
-                    shutil.rmtree(temp_dir)
-                except:
-                    pass
-     # ==========*************** funciones OCRmyPDF ***************==========
-
-
-
     def extract_text_from_pdf(self, pdf_path: str, use_ocr: bool = True,
                              language: str = 'spa', batch_size: int = 20) -> Tuple[str, int, bool]:
         """Extrae texto de PDF optimizado para velocidad y memoria"""

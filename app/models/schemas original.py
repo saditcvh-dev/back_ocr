@@ -19,10 +19,6 @@ class PDFUploadResponse(BaseModel):
     status: str  # "pending", "processing", "completed", "failed"
     message: str
     estimated_wait_time: Optional[float] = None  # segundos estimados
-    # Modificado por: Nico
-    # Cambio: Agregado campo 'generate_searchable_pdf' a la respuesta
-    # Motivo: Informar al usuario si su PDF se procesará con OCRmyPDF para generar versión searchable
-    generate_searchable_pdf: bool = False
 
 
 # ===============================
@@ -35,11 +31,6 @@ class PDFUploadStatus(BaseModel):
     pages: Optional[int] = None
     extracted_text_path: Optional[str] = None
     used_ocr: Optional[bool] = None
-    # Modificado por: Nico
-    # Cambio: Agregados campos relacionados con generación de PDF searchable
-    # Motivo: Permitir seguimiento del procesamiento con OCRmyPDF en el estado
-    generate_searchable_pdf: bool = False
-    searchable_pdf_path: Optional[str] = None
     progress: Optional[int] = None  # 0-100
     error: Optional[str] = None
     created_at: Optional[datetime] = None

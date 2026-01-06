@@ -32,18 +32,8 @@ pdf_storage = {}
 pdf_task_status = {}  # {pdf_id: {task_id, status, created_at, etc.}}
 
 @router.post("/upload", response_model=PDFUploadResponse)
-async def upload_pdf(
-    file: UploadFile = File(...), 
-    use_ocr: bool = Query(True),
-    generate_searchable_pdf: bool = Query(False, description="Generar PDF searchable con OCRmyPDF")
-):
-    """
-    Sube un PDF a la cola de procesamiento sin esperar a que se procese.
-    
-    Modificado por: Nico
-    Cambio: Agregado parámetro 'generate_searchable_pdf' para crear PDFs con texto incrustado
-    Motivo: Permitir a los usuarios generar versiones searchable de PDFs escaneados usando OCRmyPDF
-    """
+async def upload_pdf(file: UploadFile = File(...), use_ocr: bool = Query(True)):
+    """Sube un PDF a la cola de procesamiento sin esperar a que se procese"""
     try:
         if not file.filename.lower().endswith('.pdf'):
             raise HTTPException(status_code=400, detail="Solo se permiten archivos PDF")
@@ -60,8 +50,7 @@ async def upload_pdf(
         task = process_pdf_task.delay(
             pdf_id=pdf_id,
             pdf_path=pdf_path,
-            use_ocr=use_ocr,
-            generate_searchable_pdf=generate_searchable_pdf
+            use_ocr=use_ocr
         )
         
         # 3. Guardar metadatos en memoria
@@ -72,8 +61,7 @@ async def upload_pdf(
             'size': len(file_bytes),
             'upload_time': time.time(),
             'task_id': task.id,
-            'use_ocr': use_ocr,
-            'generate_searchable_pdf': generate_searchable_pdf
+            'use_ocr': use_ocr
         }
         
         pdf_task_status[pdf_id] = {
@@ -84,8 +72,6 @@ async def upload_pdf(
             'pages': None,
             'extracted_text_path': None,
             'used_ocr': use_ocr,
-            'generate_searchable_pdf': generate_searchable_pdf,
-            'searchable_pdf_path': None,
             'error': None
         }
         
@@ -101,27 +87,10 @@ async def upload_pdf(
             # No hay workers -> procesar en background local (no bloquear la petición)
             logger.warning(f"No Celery workers detectados — procesando en hilo local {pdf_id}")
 
-            def _local_process(pid: str, ppath: str, puse_ocr: bool, pgenerate_pdf: bool, t_id: str):
+            def _local_process(pid: str, ppath: str, puse_ocr: bool, t_id: str):
                 try:
                     pdf_task_status[pid].update({'status': 'processing'})
-                    
-                    # Modificado por: Nico
-                    # Cambio: Lógica condicional para procesamiento con/sin PDF searchable
-                    # Motivo: Diferenciar entre extracción simple y generación de PDF con OCR incrustado
-                    # donde también se modifica el archivo app/models/schemas.py para agregar el campo generate_searchable_pdf a PDFUploadResponse.
-                    if pgenerate_pdf:
-                        text, pages, used_ocr, searchable_path = pdf_service.process_with_searchable_pdf(
-                            ppath, pid, use_ocr=puse_ocr
-                        )
-                        
-                        if searchable_path:
-                            pdf_task_status[pid].update({
-                                'searchable_pdf_path': searchable_path
-                            })
-                    else:
-                        # Solo extraer texto normalmente
-                        text, pages, used_ocr = pdf_service.extract_text_from_pdf(ppath, use_ocr=puse_ocr)
-                    
+                    text, pages, used_ocr = pdf_service.extract_text_from_pdf(ppath, use_ocr=puse_ocr)
                     text_path = pdf_service.save_extracted_text(text, pid)
 
                     pdf_task_status[pid].update({
@@ -137,16 +106,11 @@ async def upload_pdf(
                         'text_path': text_path,
                         'text': ''
                     })
-                    
                 except Exception as e:
                     logger.exception(f"Error en procesamiento local {pid}: {e}")
                     pdf_task_status[pid].update({'status': 'failed', 'error': str(e)})
 
-            thread = threading.Thread(
-                target=_local_process, 
-                args=(pdf_id, pdf_path, use_ocr, generate_searchable_pdf, task.id), 
-                daemon=True
-            )
+            thread = threading.Thread(target=_local_process, args=(pdf_id, pdf_path, use_ocr, task.id), daemon=True)
             thread.start()
 
             return PDFUploadResponse(
@@ -156,8 +120,7 @@ async def upload_pdf(
                 task_id=task.id,
                 status="pending",
                 message="PDF aceptado y procesando localmente (no hay workers).",
-                estimated_wait_time=0.0,
-                generate_searchable_pdf=generate_searchable_pdf
+                estimated_wait_time=0.0
             )
 
         # Si hay workers, devolvemos response pendiente como antes
@@ -168,8 +131,7 @@ async def upload_pdf(
             task_id=task.id,
             status="pending",
             message="PDF encolado para procesamiento. Usa el endpoint /upload-status/{pdf_id} para consultar el progreso",
-            estimated_wait_time=10.0,  # Estimado en segundos
-            generate_searchable_pdf=generate_searchable_pdf
+            estimated_wait_time=10.0  # Estimado en segundos
         )
         
     except Exception as e:
