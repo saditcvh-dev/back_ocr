@@ -8,6 +8,10 @@ import logging
 from typing import List, Tuple, Optional
 import numpy as np
 from pdf2image import convert_from_bytes
+from pathlib import Path
+import subprocess
+import shutil
+import tempfile
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -26,7 +30,20 @@ class OCRService:
             'dpi': 300,  # DPI óptimo para balance velocidad/calidad
         }
         
+        # Configuración OCRmyPDF
+        self.ocrmypdf_language = "spa"
+        self._verify_ocrmypdf_installation()
+        
         self.verify_tessdata()
+    
+    def _verify_ocrmypdf_installation(self):
+        """Verifica que OCRmyPDF esté instalado en el sistema"""
+        if not shutil.which("ocrmypdf"):
+            logger.warning("OCRmyPDF no encontrado. Funcionalidad de PDF OCR limitada.")
+            self.ocrmypdf_available = False
+        else:
+            logger.info("✅ OCRmyPDF está disponible para generar PDFs con OCR")
+            self.ocrmypdf_available = True
     
     def verify_tessdata(self):
         """Verifica que los archivos de idioma estén disponibles"""
@@ -203,3 +220,272 @@ class OCRService:
         except Exception as e:
             logger.error(f"Error en extracción con fallback: {e}")
             return "", False
+
+    # ============================================================================
+    # NUEVAS FUNCIONALIDADES OCRmyPDF (AGREGADAS SIN MODIFICAR LO EXISTENTE)
+    # ============================================================================
+    
+    def generate_ocr_pdf_file(self, input_pdf_path: Path, output_pdf_path: Path, 
+                              language: str = "spa", force_ocr: bool = True) -> bool:
+        """
+        GENERA PDF CON OCR INCUBIERTO USANDO OCRmyPDF
+        
+        Función nueva que NO modifica las existentes
+        Propósito: Crear PDFs con texto OCR encima (searchable PDFs)
+        
+        Args:
+            input_pdf_path: Ruta al PDF de entrada
+            output_pdf_path: Ruta donde guardar el PDF con OCR
+            language: Idioma para OCR (ej: 'spa', 'eng', 'spa+eng')
+            force_ocr: Forzar OCR incluso si el PDF ya tiene texto
+        
+        Returns:
+            bool: True si se generó exitosamente, False si falló
+        """
+        if not self.ocrmypdf_available:
+            logger.error("❌ No se puede generar PDF OCR: OCRmyPDF no está instalado")
+            logger.info("💡 Instala con: pip install ocrmypdf")
+            return False
+        
+        if not input_pdf_path.exists():
+            logger.error(f"❌ Archivo no encontrado: {input_pdf_path}")
+            return False
+        
+        logger.info(f"🚀 Generando PDF con OCR: {input_pdf_path.name} -> {output_pdf_path.name}")
+        
+        try:
+            # Crear directorio de salida si no existe
+            output_pdf_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Comando OCRmyPDF optimizado
+            command = [
+                "ocrmypdf",
+                "-l", language,
+                "--output-type", "pdf",      # PDF normal (no PDF/A)
+                "--optimize", "1",           # Optimización leve
+                "--jpeg-quality", "90",      # Calidad balanceada
+                "--skip-text" if not force_ocr else "--force-ocr",
+                "--deskew",                  # Enderezar páginas inclinadas
+                "--clean",                   # Limpiar imágenes
+                "--quiet",                   # Menos output en consola
+                str(input_pdf_path),
+                str(output_pdf_path)
+            ]
+            
+            logger.debug(f"Ejecutando: {' '.join(command)}")
+            
+            # Ejecutar OCRmyPDF
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=300  # 5 minutos timeout
+            )
+            
+            if result.returncode == 0:
+                logger.info(f"✅ PDF con OCR generado exitosamente: {output_pdf_path}")
+                return True
+            elif result.returncode in [1, 2, 3] and output_pdf_path.exists():
+                # OCRmyPDF puede terminar con warnings pero el archivo existe
+                logger.warning(f"⚠️ OCRmyPDF terminó con advertencias (código {result.returncode})")
+                logger.info(f"✅ PDF generado a pesar de warnings: {output_pdf_path}")
+                return True
+            else:
+                logger.error(f"❌ Error en OCRmyPDF (código {result.returncode})")
+                logger.error(f"Error: {result.stderr[:500]}")
+                return False
+                
+        except subprocess.TimeoutExpired:
+            logger.error(f"⏰ Timeout: OCRmyPDF tardó más de 5 minutos")
+            return False
+        except Exception as e:
+            logger.error(f"❌ Error inesperado generando PDF OCR: {e}")
+            return False
+    
+    def generate_ocr_pdf_from_bytes(self, pdf_bytes: bytes, output_pdf_path: Path,
+                                   language: str = "spa") -> bool:
+        """
+        GENERA PDF CON OCR DESDE BYTES EN MEMORIA
+        
+        Función nueva para procesar PDFs desde APIs o archivos en memoria
+        
+        Args:
+            pdf_bytes: Bytes del PDF
+            output_pdf_path: Ruta donde guardar el PDF con OCR
+            language: Idioma para OCR
+        
+        Returns:
+            bool: True si se generó exitosamente
+        """
+        # Crear archivo temporal
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_file:
+            temp_path = Path(temp_file.name)
+            temp_file.write(pdf_bytes)
+        
+        try:
+            # Usar la función de archivo
+            result = self.generate_ocr_pdf_file(temp_path, output_pdf_path, language)
+            return result
+        finally:
+            # Limpiar archivo temporal
+            try:
+                temp_path.unlink()
+            except:
+                pass
+    
+    def batch_generate_ocr_pdfs(self, input_dir: Path, output_dir: Path,
+                               language: str = "spa", max_workers: int = 2) -> dict:
+        """
+        GENERA PDFs CON OCR EN LOTE (múltiples archivos)
+        
+        Función nueva para procesamiento masivo
+        
+        Args:
+            input_dir: Directorio con PDFs de entrada
+            output_dir: Directorio donde guardar PDFs con OCR
+            language: Idioma para OCR
+            max_workers: Número de procesos paralelos
+        
+        Returns:
+            dict: Estadísticas del procesamiento
+        """
+        if not input_dir.exists():
+            logger.error(f"❌ Directorio no encontrado: {input_dir}")
+            return {"success": 0, "failed": 0, "total": 0}
+        
+        # Crear directorio de salida
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Encontrar todos los PDFs
+        pdf_files = list(input_dir.glob("*.pdf"))
+        total_files = len(pdf_files)
+        
+        if total_files == 0:
+            logger.warning(f"⚠️ No se encontraron PDFs en: {input_dir}")
+            return {"success": 0, "failed": 0, "total": 0}
+        
+        logger.info(f"📊 Procesando {total_files} PDFs en lote...")
+        
+        results = {"success": 0, "failed": 0, "total": total_files}
+        
+        # Procesar en paralelo
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_file = {}
+            
+            for pdf_file in pdf_files:
+                output_file = output_dir / f"{pdf_file.stem}_ocr.pdf"
+                future = executor.submit(
+                    self.generate_ocr_pdf_file,
+                    pdf_file,
+                    output_file,
+                    language
+                )
+                future_to_file[future] = pdf_file.name
+            
+            # Recoger resultados
+            for future in concurrent.futures.as_completed(future_to_file):
+                filename = future_to_file[future]
+                try:
+                    success = future.result(timeout=300)  # 5 minutos por archivo
+                    if success:
+                        results["success"] += 1
+                        logger.info(f"✅ {filename} - OK")
+                    else:
+                        results["failed"] += 1
+                        logger.error(f"❌ {filename} - Falló")
+                except concurrent.futures.TimeoutError:
+                    results["failed"] += 1
+                    logger.error(f"⏰ {filename} - Timeout")
+                except Exception as e:
+                    results["failed"] += 1
+                    logger.error(f"⚠️ {filename} - Error: {e}")
+        
+        logger.info(f"📊 Resumen lote: {results['success']}/{results['total']} exitosos")
+        return results
+    
+    def get_ocrmypdf_info(self) -> dict:
+        """
+        OBTIENE INFORMACIÓN SOBRE OCRmyPDF INSTALADO
+        
+        Función nueva para diagnóstico
+        
+        Returns:
+            dict: Información de la instalación
+        """
+        info = {
+            "available": self.ocrmypdf_available,
+            "version": None,
+            "tesseract_version": None
+        }
+        
+        if not self.ocrmypdf_available:
+            return info
+        
+        try:
+            # Obtener versión de OCRmyPDF
+            result = subprocess.run(
+                ["ocrmypdf", "--version"],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                info["version"] = result.stdout.strip()
+            
+            # Obtener versión de Tesseract que usa OCRmyPDF
+            result = subprocess.run(
+                ["ocrmypdf", "--help"],
+                capture_output=True,
+                text=True
+            )
+            # Buscar información de Tesseract en el output
+            for line in result.stdout.split('\n'):
+                if "tesseract" in line.lower():
+                    info["tesseract_info"] = line.strip()
+                    break
+                    
+        except Exception as e:
+            logger.warning(f"No se pudo obtener info de OCRmyPDF: {e}")
+        
+        return info
+
+    # ============================================================================
+    # FUNCIÓN CONVENIENCIA PARA USO RÁPIDO
+    # ============================================================================
+    
+    def quick_ocr_pdf(self, input_path: str, output_path: str = None, 
+                     language: str = "spa") -> Tuple[bool, str]:
+        """
+        FUNCIÓN CONVENIENCIA PARA GENERAR PDF OCR RÁPIDAMENTE
+        
+        Uso simple: ocr_service.quick_ocr_pdf("entrada.pdf", "salida_ocr.pdf")
+        
+        Args:
+            input_path: Ruta al PDF de entrada
+            output_path: Ruta de salida (opcional, genera automáticamente)
+            language: Idioma para OCR
+        
+        Returns:
+            Tuple[bool, str]: (éxito, mensaje/ruta)
+        """
+        input_pdf = Path(input_path)
+        
+        if not input_pdf.exists():
+            return False, f"Archivo no encontrado: {input_path}"
+        
+        if output_path is None:
+            output_pdf = input_pdf.parent / f"{input_pdf.stem}_ocr.pdf"
+        else:
+            output_pdf = Path(output_path)
+        
+        success = self.generate_ocr_pdf_file(input_pdf, output_pdf, language)
+        
+        if success:
+            return True, f"PDF OCR generado: {output_pdf}"
+        else:
+            return False, "Error generando PDF OCR"
+# ============================================================================
+# FIN DE AGREGADOS OCRmyPDF
+# Se mantuvo toda la funcionalidad existente de pytesseract
+# Se agregaron nuevas funciones para generar PDFs con OCR
+# Compatibilidad total: puedes usar ambos sistemas
+# ============================================================================

@@ -3,7 +3,7 @@ from fastapi.responses import FileResponse, JSONResponse
 import os
 import time
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Optional
 from app.services.pdf_service import PDFService
 from app.models.schemas import (
     PDFUploadResponse, 
@@ -15,7 +15,7 @@ from app.models.schemas import (
     PDFListResponse
 )
 from app.core.config import settings
-from app.tasks.pdf_tasks import process_pdf_task
+from app.tasks.pdf_tasks import process_pdf_task, generate_ocr_pdf_task, full_process_pdf_task
 from app.core.celery_app import celery_app
 import logging
 import threading
@@ -35,15 +35,9 @@ pdf_task_status = {}  # {pdf_id: {task_id, status, created_at, etc.}}
 async def upload_pdf(
     file: UploadFile = File(...), 
     use_ocr: bool = Query(True),
-    generate_searchable_pdf: bool = Query(False, description="Generar PDF searchable con OCRmyPDF")
+    use_ocrmypdf: bool = Query(True, description="Usar OCRmyPDF para mejor calidad OCR")
 ):
-    """
-    Sube un PDF a la cola de procesamiento sin esperar a que se procese.
-    
-    Modificado por: Nico
-    Cambio: Agregado parámetro 'generate_searchable_pdf' para crear PDFs con texto incrustado
-    Motivo: Permitir a los usuarios generar versiones searchable de PDFs escaneados usando OCRmyPDF
-    """
+    """Sube un PDF a la cola de procesamiento sin esperar a que se procese"""
     try:
         if not file.filename.lower().endswith('.pdf'):
             raise HTTPException(status_code=400, detail="Solo se permiten archivos PDF")
@@ -56,12 +50,12 @@ async def upload_pdf(
         with open(pdf_path, "wb") as f:
             f.write(file_bytes)
         
-        # 2. Encolar tarea de procesamiento en Celery
+        # 2. Encolar tarea de procesamiento en Celery con nuevo parámetro use_ocrmypdf
         task = process_pdf_task.delay(
             pdf_id=pdf_id,
             pdf_path=pdf_path,
             use_ocr=use_ocr,
-            generate_searchable_pdf=generate_searchable_pdf
+            use_ocrmypdf=use_ocrmypdf  # NUEVO PARÁMETRO
         )
         
         # 3. Guardar metadatos en memoria
@@ -73,7 +67,7 @@ async def upload_pdf(
             'upload_time': time.time(),
             'task_id': task.id,
             'use_ocr': use_ocr,
-            'generate_searchable_pdf': generate_searchable_pdf
+            'use_ocrmypdf': use_ocrmypdf  # NUEVO: guardar si se usó OCRmyPDF
         }
         
         pdf_task_status[pdf_id] = {
@@ -84,8 +78,7 @@ async def upload_pdf(
             'pages': None,
             'extracted_text_path': None,
             'used_ocr': use_ocr,
-            'generate_searchable_pdf': generate_searchable_pdf,
-            'searchable_pdf_path': None,
+            'used_ocrmypdf': use_ocrmypdf,  # NUEVO
             'error': None
         }
         
@@ -101,27 +94,14 @@ async def upload_pdf(
             # No hay workers -> procesar en background local (no bloquear la petición)
             logger.warning(f"No Celery workers detectados — procesando en hilo local {pdf_id}")
 
-            def _local_process(pid: str, ppath: str, puse_ocr: bool, pgenerate_pdf: bool, t_id: str):
+            def _local_process(pid: str, ppath: str, puse_ocr: bool, puse_ocrmypdf: bool, t_id: str):
                 try:
                     pdf_task_status[pid].update({'status': 'processing'})
-                    
-                    # Modificado por: Nico
-                    # Cambio: Lógica condicional para procesamiento con/sin PDF searchable
-                    # Motivo: Diferenciar entre extracción simple y generación de PDF con OCR incrustado
-                    # donde también se modifica el archivo app/models/schemas.py para agregar el campo generate_searchable_pdf a PDFUploadResponse.
-                    if pgenerate_pdf:
-                        text, pages, used_ocr, searchable_path = pdf_service.process_with_searchable_pdf(
-                            ppath, pid, use_ocr=puse_ocr
-                        )
-                        
-                        if searchable_path:
-                            pdf_task_status[pid].update({
-                                'searchable_pdf_path': searchable_path
-                            })
-                    else:
-                        # Solo extraer texto normalmente
-                        text, pages, used_ocr = pdf_service.extract_text_from_pdf(ppath, use_ocr=puse_ocr)
-                    
+                    text, pages, used_ocr = pdf_service.extract_text_from_pdf(
+                        ppath, 
+                        use_ocr=puse_ocr,
+                        use_ocrmypdf=puse_ocrmypdf  # NUEVO: pasar parámetro
+                    )
                     text_path = pdf_service.save_extracted_text(text, pid)
 
                     pdf_task_status[pid].update({
@@ -129,6 +109,7 @@ async def upload_pdf(
                         'pages': pages,
                         'extracted_text_path': text_path,
                         'used_ocr': used_ocr,
+                        'used_ocrmypdf': used_ocr,  # Si usó OCR, probablemente usó OCRmyPDF si estaba disponible
                         'completed_at': datetime.now()
                     })
 
@@ -137,14 +118,13 @@ async def upload_pdf(
                         'text_path': text_path,
                         'text': ''
                     })
-                    
                 except Exception as e:
                     logger.exception(f"Error en procesamiento local {pid}: {e}")
                     pdf_task_status[pid].update({'status': 'failed', 'error': str(e)})
 
             thread = threading.Thread(
                 target=_local_process, 
-                args=(pdf_id, pdf_path, use_ocr, generate_searchable_pdf, task.id), 
+                args=(pdf_id, pdf_path, use_ocr, use_ocrmypdf, task.id),  # NUEVO: agregar use_ocrmypdf
                 daemon=True
             )
             thread.start()
@@ -156,8 +136,7 @@ async def upload_pdf(
                 task_id=task.id,
                 status="pending",
                 message="PDF aceptado y procesando localmente (no hay workers).",
-                estimated_wait_time=0.0,
-                generate_searchable_pdf=generate_searchable_pdf
+                estimated_wait_time=0.0
             )
 
         # Si hay workers, devolvemos response pendiente como antes
@@ -168,13 +147,239 @@ async def upload_pdf(
             task_id=task.id,
             status="pending",
             message="PDF encolado para procesamiento. Usa el endpoint /upload-status/{pdf_id} para consultar el progreso",
-            estimated_wait_time=10.0,  # Estimado en segundos
-            generate_searchable_pdf=generate_searchable_pdf
+            estimated_wait_time=10.0  # Estimado en segundos
         )
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al encolar PDF: {str(e)}")
 
+# ============================================================================
+# NUEVOS ENDPOINTS PARA OCRmyPDF (NO MODIFICAN LOS EXISTENTES)
+# ============================================================================
+
+@router.post("/generate-ocr-pdf")
+async def generate_ocr_pdf_endpoint(
+    file: UploadFile = File(...),
+    language: str = Query('spa', description="Idioma para OCR"),
+    output_filename: Optional[str] = Query(None, description="Nombre del archivo de salida (opcional)")
+):
+    """
+    GENERAR PDF CON OCR INCUBIERTO (searchable PDF)
+    
+    Diferencia con /upload:
+    - /upload: Extrae texto y lo guarda en .txt
+    - /generate-ocr-pdf: Genera un NUEVO PDF con texto OCR incrustado (searchable)
+    
+    Útil para: documentos escaneados, imágenes PDF, recibos, contratos, etc.
+    """
+    try:
+        if not file.filename.lower().endswith('.pdf'):
+            raise HTTPException(status_code=400, detail="Solo se permiten archivos PDF")
+        
+        file_bytes = await file.read()
+        
+        # Guardar archivo temporalmente
+        temp_id = f"ocr_gen_{int(time.time())}"
+        temp_path = os.path.join(settings.UPLOAD_FOLDER, f"{temp_id}.pdf")
+        with open(temp_path, "wb") as f:
+            f.write(file_bytes)
+        
+        # Definir ruta de salida
+        if output_filename:
+            if not output_filename.endswith('.pdf'):
+                output_filename += '.pdf'
+            output_path = os.path.join(settings.UPLOAD_FOLDER, output_filename)
+        else:
+            output_path = os.path.join(
+                settings.UPLOAD_FOLDER, 
+                f"{os.path.splitext(file.filename)[0]}_ocr.pdf"
+            )
+        
+        # Encolar tarea para generar PDF con OCR
+        task = generate_ocr_pdf_task.delay(
+            input_pdf_path=temp_path,
+            output_pdf_path=output_path,
+            language=language
+        )
+        
+        # Guardar información de la tarea
+        ocr_task_id = f"ocr_pdf_{temp_id}"
+        pdf_task_status[ocr_task_id] = {
+            'task_id': task.id,
+            'status': 'pending',
+            'created_at': datetime.now(),
+            'completed_at': None,
+            'input_file': file.filename,
+            'output_file': output_path,
+            'language': language,
+            'error': None
+        }
+        
+        return {
+            "message": "PDF en cola para generación con OCR",
+            "task_id": task.id,
+            "ocr_task_id": ocr_task_id,
+            "input_file": file.filename,
+            "output_file": os.path.basename(output_path),
+            "status": "pending"
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al generar PDF con OCR: {str(e)}")
+
+@router.post("/full-process")
+async def full_process_pdf_endpoint(
+    file: UploadFile = File(...),
+    use_ocr: bool = Query(True),
+    generate_ocr_pdf: bool = Query(False, description="Generar PDF con OCR incrustado además de extraer texto"),
+    language: str = Query('spa', description="Idioma para OCR")
+):
+    """
+    PROCESO COMPLETO: Extrae texto Y opcionalmente genera PDF con OCR
+    
+    Combina ambas funcionalidades en una sola llamada:
+    1. Extrae texto del PDF (guarda en .txt)
+    2. Opcionalmente genera PDF con OCR incrustado (searchable PDF)
+    
+    Ideal para: Procesamiento completo de documentos escaneados
+    """
+    try:
+        if not file.filename.lower().endswith('.pdf'):
+            raise HTTPException(status_code=400, detail="Solo se permiten archivos PDF")
+        
+        file_bytes = await file.read()
+        pdf_id = pdf_service.generate_pdf_id(file.filename, file_bytes)
+        
+        # Guardar archivo
+        pdf_path = os.path.join(settings.UPLOAD_FOLDER, f"{pdf_id}.pdf")
+        with open(pdf_path, "wb") as f:
+            f.write(file_bytes)
+        
+        # Encolar tarea completa
+        task = full_process_pdf_task.delay(
+            pdf_id=pdf_id,
+            pdf_path=pdf_path,
+            use_ocr=use_ocr,
+            generate_ocr_pdf=generate_ocr_pdf,
+            language=language
+        )
+        
+        # Guardar metadatos
+        now = datetime.now()
+        pdf_storage[pdf_id] = {
+            'filename': file.filename,
+            'pdf_path': pdf_path,
+            'size': len(file_bytes),
+            'upload_time': time.time(),
+            'task_id': task.id,
+            'use_ocr': use_ocr,
+            'full_process': True,
+            'generate_ocr_pdf': generate_ocr_pdf
+        }
+        
+        pdf_task_status[pdf_id] = {
+            'task_id': task.id,
+            'status': 'pending',
+            'created_at': now,
+            'completed_at': None,
+            'pages': None,
+            'extracted_text_path': None,
+            'ocr_pdf_path': None,
+            'used_ocr': use_ocr,
+            'generate_ocr_pdf': generate_ocr_pdf,
+            'error': None
+        }
+        
+        return {
+            "message": "PDF en cola para procesamiento completo",
+            "pdf_id": pdf_id,
+            "task_id": task.id,
+            "extract_text": True,
+            "generate_ocr_pdf": generate_ocr_pdf,
+            "status": "pending"
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en procesamiento completo: {str(e)}")
+
+@router.get("/ocr-capabilities")
+async def get_ocr_capabilities():
+    """
+    OBTENER INFORMACIÓN SOBRE CAPACIDADES OCR DISPONIBLES
+    
+    Verifica si OCRmyPDF está instalado y disponible
+    Útil para diagnóstico del sistema
+    """
+    try:
+        capabilities = pdf_service.get_ocr_capabilities()
+        
+        return {
+            "system": "PDF OCR Processing System",
+            "timestamp": datetime.now().isoformat(),
+            "capabilities": capabilities,
+            "recommendation": "Usar OCRmyPDF para mejor calidad" if capabilities.get('ocrmypdf', {}).get('available') else "Usar Tesseract (OCRmyPDF no disponible)",
+            "installation_help": "Instalar OCRmyPDF: pip install ocrmypdf" if not capabilities.get('ocrmypdf', {}).get('available') else None
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error obteniendo capacidades OCR: {str(e)}")
+
+@router.get("/download-ocr-pdf/{task_id}")
+async def download_ocr_pdf(task_id: str):
+    """
+    DESCARGAR PDF CON OCR GENERADO
+    
+    Descarga el PDF con OCR incrustado generado por una tarea
+    """
+    # Buscar la tarea por ID
+    task_info = None
+    for tid, info in pdf_task_status.items():
+        if info.get('task_id') == task_id:
+            task_info = info
+            break
+    
+    if not task_info:
+        raise HTTPException(status_code=404, detail="Tarea no encontrada")
+    
+    # Verificar estado de la tarea
+    task = celery_app.AsyncResult(task_id)
+    
+    if task.state == 'PENDING' or task.state == 'PROCESSING':
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "processing",
+                "message": "El PDF con OCR aún se está generando",
+                "task_state": task.state
+            }
+        )
+    
+    if task.state == 'FAILURE':
+        raise HTTPException(
+            status_code=400,
+            detail=f"Error generando PDF con OCR: {task.info}"
+        )
+    
+    # Si la tarea completó, obtener ruta del archivo
+    output_file = task_info.get('output_file')
+    if not output_file or not os.path.exists(output_file):
+        # Intentar obtener del resultado de la tarea
+        if task.state == 'SUCCESS' and task.result:
+            output_file = task.result.get('output_file')
+        
+        if not output_file or not os.path.exists(output_file):
+            raise HTTPException(status_code=404, detail="Archivo PDF con OCR no encontrado")
+    
+    # Servir el archivo
+    return FileResponse(
+        output_file,
+        media_type='application/pdf',
+        filename=os.path.basename(output_file)
+    )
+
+# ============================================================================
+# LOS ENDPOINTS EXISTENTES SIGUEN IGUAL (SIN CAMBIOS)
+# ============================================================================
 
 @router.get("/upload-status/{pdf_id}", response_model=PDFUploadStatus)
 async def get_upload_status(pdf_id: str):
@@ -426,17 +631,17 @@ async def get_dashboard():
             task = celery_app.AsyncResult(task_id)
             if task.state == 'STARTED':
                 status = 'processing'
-                status_display = "⏳ En procesamiento"
+                status_display = "En procesamiento"
             elif task.state == 'SUCCESS':
                 status = 'completed'
-                status_display = "✅ Completado"
+                status_display = "Completado"
             elif task.state == 'FAILURE':
                 status = 'failed'
-                status_display = "❌ Error"
+                status_display = "Error"
             else:
-                status_display = "⏸️ En cola"
+                status_display = "En cola"
         else:
-            status_display = "⏸️ En cola"
+            status_display = "En cola"
         
         # Calcular progreso
         if status == 'completed':
@@ -469,14 +674,14 @@ async def get_dashboard():
     
     # Contar estados
     estados = {
-        "completados": len([p for p in pdfs_info if "✅" in p['estado']]),
-        "procesando": len([p for p in pdfs_info if "⏳" in p['estado']]),
-        "en_cola": len([p for p in pdfs_info if "⏸️" in p['estado']]),
-        "con_error": len([p for p in pdfs_info if "❌" in p['estado']])
+        "completados": len([p for p in pdfs_info if "Completado" in p['estado']]),
+        "procesando": len([p for p in pdfs_info if "En procesamiento" in p['estado']]),
+        "en_cola": len([p for p in pdfs_info if "En cola" in p['estado']]),
+        "con_error": len([p for p in pdfs_info if "Error" in p['estado']])
     }
     
     return {
-        "titulo": "📊 Dashboard de Procesamiento de PDFs",
+        "titulo": "Dashboard de Procesamiento de PDFs",
         "total_pdfs": len(pdf_storage),
         "estados": estados,
         "pdfs": pdfs_info,
@@ -484,7 +689,9 @@ async def get_dashboard():
             "consultar_estado": "/api/pdf/upload-status/{pdf_id}",
             "buscar_en_pdf": "/api/pdf/search/{pdf_id}",
             "descargar_texto": "/api/pdf/{pdf_id}/text",
-            "lista_detallada": "/api/pdf/list"
+            "lista_detallada": "/api/pdf/list",
+            "generar_pdf_ocr": "/api/pdf/generate-ocr-pdf",
+            "proceso_completo": "/api/pdf/full-process"
         }
     }
 
@@ -540,11 +747,6 @@ async def quick_search(
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error en búsqueda rápida: {str(e)}")
-
-
-# ======================
-# NUEVO ENDPOINT: BÚSQUEDA GLOBAL
-# ======================
 
 @router.post("/global-search")
 async def global_search(
